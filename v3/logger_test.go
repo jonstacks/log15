@@ -15,6 +15,8 @@ var lvlCases = []struct {
 }
 
 func TestLvlFromString(t *testing.T) {
+	t.Parallel()
+
 	for _, tt := range lvlCases {
 		lvl, err := LvlFromString(tt.in)
 		if err != nil {
@@ -54,6 +56,5 @@ func TestLvlString(t *testing.T) {
 			t.Fatal("expected panic for invalid level")
 		}
 	}()
-
 	_ = Lvl(99).String()
 }
