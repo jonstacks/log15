@@ -18,6 +18,10 @@ const (
 	termMsgJust    = 40
 )
 
+// spacePadding is a reusable run of spaces used to right-pad short messages in
+// the terminal format, avoiding a per-record bytes.Repeat allocation.
+var spacePadding = bytes.Repeat([]byte{' '}, termMsgJust)
+
 // Format  is the interface implemented by StreamHandler formatters.
 type Format interface {
 	Format(r Record) []byte
@@ -84,7 +88,7 @@ func TerminalFormat() Format {
 
 		// try to justify the log output for short messages
 		if len(r.Ctx) > 0 && len(r.Msg) < termMsgJust {
-			b.Write(bytes.Repeat([]byte{' '}, termMsgJust-len(r.Msg)))
+			b.Write(spacePadding[:termMsgJust-len(r.Msg)])
 		}
 
 		// print the keys logfmt style
@@ -99,9 +103,26 @@ func TerminalFormat() Format {
 // For more details see: http://godoc.org/github.com/kr/logfmt
 func LogfmtFormat() Format {
 	return FormatFunc(func(r Record) []byte {
-		common := []interface{}{r.KeyNames.Time, r.Time, r.KeyNames.Lvl, r.Lvl, r.KeyNames.Msg, r.Msg}
 		buf := &bytes.Buffer{}
-		logfmt(buf, append(common, r.Ctx...), 0)
+		// Write the common time/lvl/msg fields directly instead of boxing them
+		// into an []interface{} and appending the context, which allocated a
+		// fresh slice (plus boxing) on every record.
+		var scratch [64]byte
+		buf.WriteString(r.KeyNames.Time)
+		buf.WriteByte('=')
+		buf.Write(r.Time.AppendFormat(scratch[:0], timeFormat))
+		buf.WriteByte(' ')
+		buf.WriteString(r.KeyNames.Lvl)
+		buf.WriteByte('=')
+		buf.WriteString(escapeString(r.Lvl.String()))
+		buf.WriteByte(' ')
+		buf.WriteString(r.KeyNames.Msg)
+		buf.WriteByte('=')
+		buf.WriteString(escapeString(r.Msg))
+		if len(r.Ctx) > 0 {
+			buf.WriteByte(' ')
+		}
+		logfmt(buf, r.Ctx, 0)
 		return buf.Bytes()
 	})
 }
@@ -113,9 +134,13 @@ func logfmt(buf *bytes.Buffer, ctx []interface{}, color int) {
 		}
 
 		k, ok := ctx[i].(string)
-		v := formatLogfmtValue(ctx[i+1])
-		if !ok {
-			k, v = errorKey, formatLogfmtValue(k)
+		// When the key isn't a string we emit the error key and, matching the
+		// historical behaviour, format the (empty) failed assertion as the value.
+		var v interface{}
+		if ok {
+			v = ctx[i+1]
+		} else {
+			k, v = errorKey, ""
 		}
 
 		// XXX: we should probably check that all of your key bytes aren't invalid
@@ -125,12 +150,11 @@ func logfmt(buf *bytes.Buffer, ctx []interface{}, color int) {
 			buf.WriteString("m")
 			buf.WriteString(k)
 			buf.WriteString("\x1b[0m=")
-			buf.WriteString(v)
 		} else {
 			buf.WriteString(k)
 			buf.WriteByte('=')
-			buf.WriteString(v)
 		}
+		writeLogfmtValue(buf, v)
 	}
 
 	buf.WriteByte('\n')
@@ -220,6 +244,60 @@ func formatJSONValue(value interface{}) interface{} {
 		return value
 	default:
 		return fmt.Sprintf("%+v", value)
+	}
+}
+
+// writeLogfmtValue writes the logfmt encoding of value directly into buf. It
+// mirrors formatLogfmtValue exactly but avoids allocating an intermediate
+// string for numeric and time values by appending into a stack-local scratch
+// buffer. formatShared is still used for the error/Stringer path so its
+// nil-pointer recover semantics are preserved.
+func writeLogfmtValue(buf *bytes.Buffer, value interface{}) {
+	if value == nil {
+		buf.WriteString("nil")
+		return
+	}
+
+	var scratch [64]byte
+	if t, ok := value.(time.Time); ok {
+		// Performance optimization: No need for escaping since the provided
+		// timeFormat doesn't have any escape characters, and escaping is
+		// expensive.
+		buf.Write(t.AppendFormat(scratch[:0], timeFormat))
+		return
+	}
+	value = formatShared(value)
+	switch v := value.(type) {
+	case bool:
+		buf.Write(strconv.AppendBool(scratch[:0], v))
+	case float32:
+		buf.Write(strconv.AppendFloat(scratch[:0], float64(v), floatFormat, 3, 64))
+	case float64:
+		buf.Write(strconv.AppendFloat(scratch[:0], v, floatFormat, 3, 64))
+	case int:
+		buf.Write(strconv.AppendInt(scratch[:0], int64(v), 10))
+	case int8:
+		buf.Write(strconv.AppendInt(scratch[:0], int64(v), 10))
+	case int16:
+		buf.Write(strconv.AppendInt(scratch[:0], int64(v), 10))
+	case int32:
+		buf.Write(strconv.AppendInt(scratch[:0], int64(v), 10))
+	case int64:
+		buf.Write(strconv.AppendInt(scratch[:0], v, 10))
+	case uint:
+		buf.Write(strconv.AppendUint(scratch[:0], uint64(v), 10))
+	case uint8:
+		buf.Write(strconv.AppendUint(scratch[:0], uint64(v), 10))
+	case uint16:
+		buf.Write(strconv.AppendUint(scratch[:0], uint64(v), 10))
+	case uint32:
+		buf.Write(strconv.AppendUint(scratch[:0], uint64(v), 10))
+	case uint64:
+		buf.Write(strconv.AppendUint(scratch[:0], v, 10))
+	case string:
+		buf.WriteString(escapeString(v))
+	default:
+		buf.WriteString(escapeString(fmt.Sprintf("%+v", value)))
 	}
 }
 
